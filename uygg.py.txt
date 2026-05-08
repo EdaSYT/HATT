@@ -1,0 +1,154 @@
+import streamlit as st
+import pandas as pd
+from ortools.sat.python import cp_model
+import time
+
+# Sayfa Ayarları
+st.set_page_config(layout="wide", page_title="Hattı Dengeleme Optimizasyonu")
+st.title("🏭 Montaj Hattı Dengeleme Sistemi (Tam Liste)")
+st.markdown("1'den 36 Operatöre kadar tüm senaryolar tek tek hesaplanmaktadır.")
+
+# =========================================================
+# VERİ SETİ VE ÖN HAZIRLIK
+# =========================================================
+I = range(1, 64)
+J = range(1, 37)
+W = range(1, 37)
+
+t_raw = {
+    1: 2.43,  2: 9.79,  3: 2.12,  4: 9.92,  5: 4.66,  6: 11.58,
+    7: 1.01,  8: 1.44,  9: 9.66, 10: 10.30, 11: 0.49, 12: 7.13,
+    13: 7.18, 14: 2.44, 15: 3.58, 16: 4.90, 17: 3.21, 18: 7.78,
+    19: 11.27, 20: 11.35, 21: 0.80, 22: 3.31, 23: 9.83, 24: 0.80,
+    25: 4.61, 26: 5.20, 27: 11.89, 28: 6.30, 29: 13.32, 30: 0.98,
+    31: 14.20, 32: 6.13, 33: 0.98, 34: 14.49, 35: 3.14, 36: 12.12,
+    37: 1.07, 38: 5.14, 39: 5.63, 40: 0.57, 41: 10.13, 42: 0.90,
+    43: 1.39, 44: 1.43, 45: 0.51, 46: 10.74, 47: 5.65, 48: 7.38,
+    49: 1.71, 50: 15.09, 51: 7.31, 52: 6.93, 53: 10.72, 54: 1.31,
+    55: 6.45, 56: 2.39, 57: 0.89, 58: 11.06, 59: 8.02, 60: 6.48,
+    61: 3.13, 62: 0.53, 63: 7.74
+}
+
+SCALE = 100
+t = {i: int(round(t_raw[i] * SCALE)) for i in t_raw}
+P = [(i, i + 1) for i in range(1, 63)]
+d = {j: {k: 2 * abs(j - k) for k in J} for j in J}
+BIG_M = sum(t.values())
+
+with st.sidebar:
+    st.header("⚙️ Parametreler")
+    L_val = st.number_input("Maks. Yürüme Mesafesi (L)", value=4)
+    D_target = st.number_input("Hedef Üretim (D)", value=32)
+    T_shift = st.number_input("Vardiya Süresi (dk)", value=510)
+    U_max = st.slider("Maks. Doluluk (U_MAX)", 0.1, 1.0, 1.0)
+    time_per_run = st.slider("Senaryo Başına Süre (sn)", 5, 60, 20)
+
+# =========================================================
+# MODEL ÇÖZÜCÜ
+# =========================================================
+def solve_single_scenario(worker_count):
+    model = cp_model.CpModel()
+    
+    # Değişkenler
+    x = {(i, j): model.NewBoolVar(f'x_{i}_{j}') for i in I for j in J}
+    y = {(w, j): model.NewBoolVar(f'y_{w}_{j}') for w in W for j in J}
+    z = {w: model.NewBoolVar(f'z_{w}') for w in W}
+    s = {j: model.NewBoolVar(f's_{j}') for j in J}
+    l = {j: model.NewIntVar(0, BIG_M, f'l_{j}') for j in J}
+    q = {(w, j): model.NewIntVar(0, BIG_M, f'q_{w}_{j}') for w in W for j in J}
+    C = model.NewIntVar(0, BIG_M, 'C')
+
+    # Kısıtlar
+    for i in I: model.Add(sum(x[i, j] for j in J) == 1)
+    for i, h in P: model.Add(sum(j * x[i, j] for j in J) <= sum(j * x[h, j] for j in J))
+    for j in J: model.Add(l[j] == sum(t[i] * x[i, j] for i in I))
+    for j in J: model.Add(sum(y[w, j] for w in W) == s[j])
+    for i in I:
+        for j in J: model.Add(x[i, j] <= s[j])
+    for j in J: model.Add(sum(x[i, j] for i in I) >= s[j])
+    for j in range(1, len(J)): model.Add(s[j] >= s[j + 1])
+    for w in W:
+        for j in J: model.Add(y[w, j] <= z[w])
+    for w in range(1, len(W)): model.Add(z[w] >= z[w + 1])
+    
+    for w in W:
+        for j in J:
+            model.Add(q[w, j] <= l[j])
+            model.Add(q[w, j] <= BIG_M * y[w, j])
+            model.Add(q[w, j] >= l[j] - BIG_M * (1 - y[w, j]))
+            
+    for w in W: model.Add(sum(q[w, j] for j in J) <= C)
+    for j in J: model.Add(l[j] <= C)
+    
+    for w in W:
+        model.Add(D_target * sum(q[w, j] for j in J) <= int(round(U_max * T_shift * SCALE)))
+    
+    for w in W:
+        for j in J:
+            for k in J:
+                if j < k and d[j][k] > L_val: model.Add(y[w, j] + y[w, k] <= 1)
+    
+    # Epsilon Kısıtı: Tam olarak bu kadar işçi kullan
+    model.Add(sum(z[w] for w in W) == worker_count)
+
+    model.Minimize(C)
+    
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(time_per_run)
+    status = solver.Solve(model)
+
+    if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
+        c_val = solver.Value(C) / SCALE
+        return {
+            "C": c_val,
+            "output": T_shift / c_val,
+            "success": "Evet" if (T_shift / c_val) >= D_target - 0.01 else "Hayır"
+        }
+    return None
+
+# =========================================================
+# ÇALIŞTIRMA VE TABLO OLUŞTURMA
+# =========================================================
+if st.button("🚀 1-36 Tüm Operatör Senaryolarını Hesapla"):
+    results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for w_count in range(1, 37):
+        status_text.text(f"Hesaplanıyor: Operatör Sayısı {w_count}/36...")
+        res = solve_single_scenario(w_count)
+        
+        if res:
+            results.append({
+                "Epsilon (İşçi)": w_count,
+                "F1 (C - dk)": f"{res['C']:.2f}",
+                "F2 (Z)": w_count,
+                "Ulaşılabilir Üretim": f"{res['output']:.2f}",
+                "Hedef?": res['success']
+            })
+        else:
+            results.append({
+                "Epsilon (İşçi)": w_count,
+                "F1 (C - dk)": "Çözüm Yok",
+                "F2 (Z)": "-",
+                "Ulaşılabilir Üretim": "-",
+                "Hedef?": "Hayır"
+            })
+        progress_bar.progress(w_count / 36)
+
+    # Colab Stili Tablo
+    st.subheader("📊 Senaryo Analiz Özet Tablosu (1 - 36)")
+    df = pd.DataFrame(results)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    # Detaylı Rapor Örneği (Colab'daki rapor gibi)
+    if any(r["F1 (C - dk)"] != "Çözüm Yok" for r in results):
+        # 29 Operatör gibi bir örnek için hızlı analiz
+        st.markdown("---")
+        st.subheader("📝 Detaylı Senaryo Raporu (Örnek: 29 Operatör)")
+        sample = next((item for item in results if item["Epsilon (İşçi)"] == 29), None)
+        if sample and sample["F1 (C - dk)"] != "Çözüm Yok":
+            st.write(f"**Çevrim Süresi (C):** {sample['F1 (C - dk)']} dk/ürün")
+            st.write(f"**Kullanılan Operatör Sayısı:** 29")
+            st.write(f"**Ulaşılabilir Üretim:** {sample['Ulaşılabilir Üretim']} adet/vardiya")
+            st.write(f"**Hedef Üretim ({D_target} adet) Sağlanıyor mu?:** {sample['Hedef?']}")
